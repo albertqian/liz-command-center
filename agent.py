@@ -34,7 +34,6 @@ FEEDS = [
     "https://defensescoop.com/feed/",
     "https://www.satellitetoday.com/feed/",
     "https://www.airandspaceforces.com/feed/",
-    "https://www.militaryaerospace.com/rss",
 ]
 
 PINK = "#EC4899"
@@ -66,7 +65,7 @@ def save_seen(seen, result):
     SEEN_FILE.write_text(json.dumps(seen, indent=2))
 
 
-def fetch_headlines(days=5, per_feed=10):
+def fetch_headlines(days=5, per_feed=6):
     cutoff = time.time() - days * 86400
     lines = []
     for url in FEEDS:
@@ -129,22 +128,39 @@ def call_claude(profile, headlines, seen):
             "country": "US", "timezone": "America/Phoenix",
         },
     }]
-    messages = [{"role": "user", "content": user}]
-    for _ in range(4):  # handle pause_turn
-        resp = client.messages.create(
-            model=MODEL, max_tokens=3500, system=SYSTEM, tools=tools, messages=messages
-        )
-        if resp.stop_reason == "pause_turn":
+    for attempt in range(2):
+        messages = [{"role": "user", "content": user}]
+        blocks = []  # every content block across pause_turn continuations
+        for _ in range(5):
+            resp = client.messages.create(
+                model=MODEL, max_tokens=10000, system=SYSTEM, tools=tools, messages=messages
+            )
+            blocks += list(resp.content)
+            print(f"tokens in={resp.usage.input_tokens} out={resp.usage.output_tokens} stop={resp.stop_reason}")
+            if resp.stop_reason != "pause_turn":
+                break
             messages.append({"role": "assistant", "content": resp.content})
-            continue
-        break
-    text = "".join(b.text for b in resp.content if b.type == "text")
-    u = resp.usage
-    print(f"tokens in={u.input_tokens} out={u.output_tokens}")
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError(f"No JSON in model output: {text[:300]}")
-    return json.loads(text[start : end + 1])
+
+        # Keep only text written AFTER the last search result (drops "let me search..." narration)
+        text = ""
+        for b in blocks:
+            if b.type == "web_search_tool_result":
+                text = ""
+            elif b.type == "text":
+                text += b.text
+
+        if resp.stop_reason == "max_tokens":
+            print("Output truncated; retrying with a shorter-output request")
+        else:
+            start = text.find("{")
+            if start != -1:
+                try:
+                    obj, _ = json.JSONDecoder().raw_decode(text[start:])
+                    return obj
+                except json.JSONDecodeError as exc:
+                    print(f"JSON parse failed: {exc}")
+        user += "\n\nIMPORTANT: Keep every field very short. Max 3 trends and 4 events. No narration before or after the JSON."
+    raise ValueError(f"No valid JSON after retries. Last text: {text[:300]}")
 
 
 def clean_events(events):
